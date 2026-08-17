@@ -89,8 +89,57 @@ curl -s http://172.27.0.253:8000/v1/models
 | reasoning_effort | medium | 思考强度（v22 模板支持 xhigh/high/medium/low）|
 | max_tokens | 1024 | 回答长度上限 |
 
+## Claude Science 沙箱内使用 (需 SSH 中转)
+
+Claude Science 的代码沙箱有**网络白名单**，无法直连内网视觉端点（如 `172.27.0.253:8000`）。在沙箱内（任何 project 的会话）使用本 skill 时，必须经 **SSH 连接器中转**：把图片 base64 传到服务器，在服务器本地调用 `localhost:8000`，再取回结果。
+
+**前提**：会话配置了 `ssh:gpu_server` 连接器（同服务器）。
+
+**中转代码**（repl 工具中执行）：
+
+```python
+# 1. 图片 → base64 (python 工具中)
+import base64, json
+b64 = base64.b64encode(open("image.png","rb").read()).decode()
+json.dump({"b64": b64}, open("handoff/img.json","w"))
+
+# 2. 经 SSH 传到服务器并调用视觉端点 (repl 工具中)
+import json
+b64 = json.load(open("handoff/img.json"))["b64"]
+script = f'''export VENV=/data/conda_envs/vllm_cuda12
+export LD_LIBRARY_PATH=$VENV/lib:${{LD_LIBRARY_PATH:-}}
+$VENV/bin/python /dev/stdin << 'PYEOF'
+import base64, json, urllib.request, mimetypes
+with open('/tmp/vision_img.png','wb') as f:
+    f.write(base64.b64decode('{b64}'))
+mime = mimetypes.guess_type('/tmp/vision_img.png')[0] or 'image/png'
+data_url = "data:%s;base64," % mime + base64.b64encode(open('/tmp/vision_img.png','rb').read()).decode()
+payload = {{
+    'model': 'qwen3.8-27b',
+    'messages': [{{'role': 'user', 'content': [
+        {{'type': 'text', 'text': '请详细描述这张图片的内容，并提取图中所有文字。'}},
+        {{'type': 'image_url', 'image_url': {{'url': data_url}}}},
+    ]}}],
+    'max_tokens': 512,
+    'temperature': 0.3,
+    'reasoning_effort': 'medium',
+}}
+req = urllib.request.Request('http://127.0.0.1:8000/v1/chat/completions',
+    data=json.dumps(payload).encode(), headers={{'Content-Type': 'application/json'}})
+with urllib.request.urlopen(req, timeout=300) as r:
+    resp = json.loads(r.read().decode())
+msg = resp['choices'][0]['message']
+print((msg.get('content') or '').strip())
+PYEOF'''
+r = host.compute.create('ssh:gpu_server').call_command(command=script, intent='Vision via SSH relay', login_shell=True, timeout_seconds=300)
+print(r.get('stdout') or r.get('stderr'))
+```
+
+**说明**：这是描述型示例——把 `question`、`max_tokens`、`reasoning_effort` 等替换成实际任务参数。多图则循环传多个文件。
+
 ## 已知限制
 
 - 视觉端点需先启动 vLLM 服务（`start_vllm.sh`）。
 - 超大图片（>10MB）建议先压缩再传。
 - 视频输入不支持（当前仅静态图片）。
+- **沙箱内不能直连内网端点**，必须走 SSH 中转（见上节）。本地 Mac / Codex 则直连无此限制。
